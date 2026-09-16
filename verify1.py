@@ -1,54 +1,40 @@
+#!/usr/bin/env python3
 """
-⚡ RAGEBITE VPS BACKEND - 1 APK SUPPORT
-✅ Database locked fix (WAL mode + thread lock)
+🔑 RAGEBITE KEY BOT (@KEY_SWARGBOT)
+Multi-App Key Generator + Maintenance Control
 """
 
+import telebot
+import datetime
 import os
 import sqlite3
-import threading
+import random
+import string
 import time
-from datetime import datetime, timedelta
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import requests
+# ==================== CONFIG ====================
+BOT_TOKEN = "8823908635:AAHO373_iqEcipIOdhACahEO-3O-ZipA21g"
+OWNER_ID = "6321758394"
 
-# ============================================================
-# CONFIG
-# ============================================================
-DD_BOT_TOKEN = "8650600804:AAFw-AuiLMtbUUHIbqwdPzVeOG8s11yfdA8"
-OWNER_ID = 6321758394
+DB_NAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ragebite.db')
 
-API_SECRET = "RAGEBITE_SECRET_2026_CHANGE_ME"
-API_PORT = 5000
-
-# ============================================================
-# 1 APK — Package name
-# ============================================================
 APP_IDS = [
     "com.ragebite.app",
 ]
 SLOTS_PER_APP = 4
-
-DB_NAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ragebite.db')
+PORT = int(os.environ.get("PORT", "8080"))
 
 STATUS_ACTIVE = "ACTIVE"
-STATUS_EXPIRED = "EXPIRED"
 STATUS_DELETED = "DELETED"
 STATUS_DISABLED = "DISABLED"
 
-rate_limit_store = {}
-db_write_lock = threading.RLock()
 
-
-# ============================================================
-# DATABASE
-# ============================================================
 def get_conn():
     conn = sqlite3.connect(DB_NAME, check_same_thread=False, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
@@ -67,379 +53,396 @@ def init_db():
         generated_by TEXT
     )''')
 
-    c.execute('''CREATE TABLE IF NOT EXISTS slots (
-        slot_id INTEGER,
-        app_id TEXT,
-        device_id TEXT,
-        key TEXT,
-        package_name TEXT,
-        ip TEXT,
-        port TEXT,
-        time_sec INTEGER,
-        start_time TEXT,
-        end_time TEXT,
-        is_active INTEGER DEFAULT 0,
-        PRIMARY KEY (app_id, slot_id)
+    c.execute('''CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
     )''')
-
-    for app_id in APP_IDS:
-        for i in range(1, SLOTS_PER_APP + 1):
-            c.execute('INSERT OR IGNORE INTO slots (app_id, slot_id, is_active) VALUES (?, ?, 0)', (app_id, i))
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('maintenance', 'off')")
 
     conn.commit()
     conn.close()
-    print(f"✅ Database ready: {DB_NAME}")
-    print(f"📱 Apps: {len(APP_IDS)} × {SLOTS_PER_APP} slots = {len(APP_IDS) * SLOTS_PER_APP} total")
 
 
-# ============================================================
-# KEY VERIFICATION
-# ============================================================
-def verify_key_with_device(key, device_id):
-    with db_write_lock:
-        conn = get_conn()
-        try:
-            c = conn.cursor()
-            c.execute('SELECT expiry, status, device_id FROM keys WHERE key = ?', (key,))
-            row = c.fetchone()
-
-            if not row:
-                return None, "NOT_FOUND", False
-
-            expiry_str, status, existing_device = row
-
-            if status == STATUS_DELETED:
-                return None, "DELETED", False
-            if status == STATUS_DISABLED:
-                return None, "DISABLED", False
-
-            expiry = datetime.strptime(expiry_str, '%Y-%m-%d %H:%M:%S')
-            if expiry < datetime.now():
-                c.execute('UPDATE keys SET status = ? WHERE key = ?', (STATUS_EXPIRED, key))
-                conn.commit()
-                return None, "EXPIRED", False
-
-            if existing_device is None:
-                c.execute('UPDATE keys SET device_id = ? WHERE key = ?', (device_id, key))
-                conn.commit()
-                print(f"🔗 Device bound: {key[:15]}...")
-                return int(expiry.timestamp() * 1000), "VALID", True
-            elif existing_device == device_id:
-                return int(expiry.timestamp() * 1000), "VALID", True
-            else:
-                return None, "DEVICE_MISMATCH", False
-        finally:
-            conn.close()
-
-
-def is_device_authorized(device_id):
-    with db_write_lock:
-        conn = get_conn()
-        try:
-            c = conn.cursor()
-            c.execute('''SELECT key, expiry, status FROM keys 
-                         WHERE device_id = ? ORDER BY created_at DESC LIMIT 1''', (device_id,))
-            row = c.fetchone()
-
-            if not row:
-                return False, None, "NO_KEY"
-
-            key, expiry_str, status = row
-            if status == STATUS_DELETED:
-                return False, key, "DELETED"
-            if status == STATUS_DISABLED:
-                return False, key, "DISABLED"
-
-            expiry = datetime.strptime(expiry_str, '%Y-%m-%d %H:%M:%S')
-            if expiry < datetime.now():
-                c.execute('UPDATE keys SET status = ? WHERE key = ?', (STATUS_EXPIRED, key))
-                conn.commit()
-                return False, key, "EXPIRED"
-
-            return True, key, "VALID"
-        finally:
-            conn.close()
-
-
-# ============================================================
-# SLOT MANAGEMENT
-# ============================================================
-def allot_slot(app_id, device_id, key, package_name, ip, port, time_sec):
-    with db_write_lock:
-        conn = get_conn()
-        try:
-            c = conn.cursor()
-
-            c.execute('SELECT slot_count FROM keys WHERE key = ?', (key,))
-            row = c.fetchone()
-            key_slot_count = row[0] if row else 4
-
-            c.execute('SELECT COUNT(*) FROM slots WHERE key = ? AND is_active = 1', (key,))
-            used_slots = c.fetchone()[0]
-
-            if used_slots >= key_slot_count:
-                return None, "KEY_SLOTS_FULL"
-
-            c.execute('SELECT slot_id FROM slots WHERE app_id=? AND device_id=? AND is_active=1',
-                      (app_id, device_id))
-            if c.fetchone():
-                return None, "ALREADY_ACTIVE"
-
-            c.execute('''SELECT slot_id FROM slots 
-                         WHERE app_id=? AND is_active=0 AND slot_id <= ? 
-                         ORDER BY slot_id ASC LIMIT 1''', (app_id, SLOTS_PER_APP))
-            slot_row = c.fetchone()
-
-            if slot_row is None:
-                return None, "ALL_SLOTS_FULL"
-
-            slot_id = slot_row[0]
-            start = datetime.now()
-            end = start + timedelta(seconds=time_sec)
-
-            c.execute('''UPDATE slots SET device_id=?, key=?, package_name=?, 
-                         ip=?, port=?, time_sec=?, start_time=?, end_time=?, is_active=1 
-                         WHERE app_id=? AND slot_id=?''',
-                      (device_id, key, package_name, ip, port, time_sec,
-                       start.strftime('%Y-%m-%d %H:%M:%S'),
-                       end.strftime('%Y-%m-%d %H:%M:%S'),
-                       app_id, slot_id))
-            conn.commit()
-            return slot_id, "OK"
-        finally:
-            conn.close()
-
-
-def release_slot(app_id, slot_id):
-    with db_write_lock:
-        conn = get_conn()
-        try:
-            c = conn.cursor()
-            c.execute('''UPDATE slots SET device_id=NULL, key=NULL, package_name=NULL,
-                         ip=NULL, port=NULL, time_sec=NULL, start_time=NULL,
-                         end_time=NULL, is_active=0 WHERE app_id=? AND slot_id=?''',
-                      (app_id, slot_id))
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def get_app_slots(app_id):
+def get_maintenance():
     conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute('SELECT * FROM slots WHERE app_id=? ORDER BY slot_id', (app_id,))
-        return c.fetchall()
-    finally:
-        conn.close()
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key='maintenance'")
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else "off"
 
 
-def get_expired_slots():
+def set_maintenance(value):
     conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('maintenance', ?)", (value,))
+    conn.commit()
+    conn.close()
+
+
+def generate_key(days, app_id, slot_count=4):
+    key = "LTN-1M-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    expiry = (datetime.datetime.now() + datetime.timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('''INSERT INTO keys (key, device_id, expiry, status, slot_count, app_id, created_at, generated_by)
+                 VALUES (?, NULL, ?, ?, ?, ?, ?, ?)''',
+              (key, expiry, STATUS_ACTIVE, slot_count, app_id,
+               datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+               str(OWNER_ID)))
+    conn.commit()
+    conn.close()
+    return key, expiry
+
+
+bot = telebot.TeleBot(BOT_TOKEN)
+
+
+def is_owner(uid):
+    return str(uid) == OWNER_ID
+
+
+@bot.message_handler(commands=['start'])
+def cmd_start(message):
+    if not is_owner(message.from_user.id):
+        bot.reply_to(message, "🚫 Only Owner")
+        return
+
+    apps_list = "\n".join([f"• `{a}`" for a in APP_IDS])
+    maint = get_maintenance()
+    maint_status = "🔴 ON" if maint == "on" else "🟢 OFF"
+
+    bot.reply_to(message, f"""🔑 **RAGEBITE KEY BOT**
+
+🔧 Maintenance: {maint_status}
+
+📱 **Available Apps:**
+{apps_list}
+
+**Commands:**
+`/genkey <days> <app_id> [slots]` — Generate key
+`/listkeys [app_id]` — List keys
+`/delkey <key>` — Delete
+`/diskey <key>` — Disable
+`/enkey <key>` — Enable
+`/keyinfo <key>` — Info
+`/resetbind <key>` — Reset device
+`/cleankeys` — Clean expired
+`/maintenance on|off` — Maintenance mode
+
+**Example:**
+`/genkey 30 com.ragebite.app 4`
+""", parse_mode='Markdown')
+
+
+@bot.message_handler(commands=['maintenance'])
+def cmd_maintenance(message):
+    if not is_owner(message.from_user.id):
+        return
+
+    command = message.text.split()
+
+    if len(command) < 2:
+        maint = get_maintenance()
+        status = "🔴 ON" if maint == "on" else "🟢 OFF"
+
+        bot.reply_to(message, f"""🔧 **MAINTENANCE STATUS**
+
+Current: {status}
+
+**Commands:**
+`/maintenance on` — Block all APKs
+`/maintenance off` — Resume all APKs
+
+⚠️ When ON: Saare APKs block ho jaayenge
+""", parse_mode='Markdown')
+        return
+
+    action = command[1].lower()
+
+    if action == "on":
+        set_maintenance("on")
+        bot.reply_to(message, """🔧 **MAINTENANCE MODE: ON**
+
+⚠️ Saare APKs ab **block** hain
+📌 Koi bhi attack nahi lagega
+📌 New keys bhi kaam nahi karengi
+
+Use `/maintenance off` to resume.""", parse_mode='Markdown')
+
+    elif action == "off":
+        set_maintenance("off")
+        bot.reply_to(message, """✅ **MAINTENANCE MODE: OFF**
+
+📌 Saare APKs wapas active
+📌 Attacks chalenge normally
+""", parse_mode='Markdown')
+
+    else:
+        bot.reply_to(message, "❌ Usage: `/maintenance on` or `/maintenance off`", parse_mode='Markdown')
+
+
+@bot.message_handler(commands=['genkey'])
+def cmd_genkey(message):
+    if not is_owner(message.from_user.id):
+        return
+
+    command = message.text.split()
+    if len(command) < 3:
+        apps_list = "\n".join([f"• `{a}`" for a in APP_IDS])
+        bot.reply_to(message, f"""❌ Usage: `/genkey <days> <app_id> [slots]`
+
+📱 **Apps:**
+{apps_list}
+
+**Example:**
+`/genkey 30 com.ragebite.app 4`
+""", parse_mode='Markdown')
+        return
+
     try:
-        c = conn.cursor()
-        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        c.execute('SELECT app_id, slot_id FROM slots WHERE is_active=1 AND end_time <= ?', (now_str,))
-        return c.fetchall()
-    finally:
-        conn.close()
+        days = int(command[1])
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid days")
+        return
 
+    app_id = command[2]
 
-def check_rate_limit(identifier, max_requests=15, window=60):
-    now_ts = time.time()
-    if identifier not in rate_limit_store:
-        rate_limit_store[identifier] = []
-    rate_limit_store[identifier] = [t for t in rate_limit_store[identifier] if now_ts - t < window]
-    if len(rate_limit_store[identifier]) >= max_requests:
-        return False
-    rate_limit_store[identifier].append(now_ts)
-    return True
-
-
-def notify_owner_dd(text):
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{DD_BOT_TOKEN}/sendMessage",
-            json={"chat_id": OWNER_ID, "text": text},
-            timeout=5)
-    except Exception as e:
-        print(f"DM error: {e}")
-
-
-# ============================================================
-# FLASK APP
-# ============================================================
-app = Flask(__name__)
-CORS(app)
-
-
-def check_auth():
-    return request.headers.get('X-API-KEY') == API_SECRET
-
-
-@app.route('/api/health', methods=['GET'])
-def api_health():
-    return jsonify({"status": "OK", "apps": APP_IDS, "slots_per_app": SLOTS_PER_APP})
-
-
-@app.route('/api/verify', methods=['POST'])
-def api_verify():
-    if not check_auth():
-        return jsonify({"error": "Unauthorized"}), 401
-
-    data = request.json or {}
-    key = data.get('key', '').upper().strip()
-    device_id = data.get('device_id', '').strip()
-
-    if not device_id:
-        return jsonify({"status": "INVALID", "reason": "NoDeviceID"})
-    if not key:
-        return jsonify({"status": "INVALID", "reason": "NoKey"})
-
-    expiry, status, _ = verify_key_with_device(key, device_id)
-    if status == "VALID":
-        return jsonify({"status": "VALID", "expiry": expiry})
-    return jsonify({"status": "INVALID", "reason": status})
-
-
-@app.route('/api/slots/status/<app_id>', methods=['GET'])
-def api_slots_status(app_id):
     if app_id not in APP_IDS:
-        return jsonify({"error": "Unknown app_id", "valid_apps": APP_IDS}), 404
+        bot.reply_to(message, f"❌ Unknown app_id. Available: {', '.join(APP_IDS)}")
+        return
 
-    rows = get_app_slots(app_id)
-    slots = []
-    for r in rows:
-        if r[10]:
-            try:
-                rem = int((datetime.strptime(r[9], '%Y-%m-%d %H:%M:%S') - datetime.now()).total_seconds())
-            except:
-                rem = 0
-            slots.append({"slot": r[0], "status": "BUSY", "remaining": max(0, rem)})
-        else:
-            slots.append({"slot": r[0], "status": "FREE", "remaining": 0})
+    try:
+        slots = int(command[3]) if len(command) > 3 else 4
+    except ValueError:
+        slots = 4
 
-    active = sum(1 for s in slots if s["status"] == "BUSY")
-    return jsonify({"app_id": app_id, "slots": slots, "active": active, "max": SLOTS_PER_APP})
+    if days < 1 or days > 3650:
+        bot.reply_to(message, "❌ Days 1-3650")
+        return
 
+    if slots < 1 or slots > 4:
+        slots = 4
 
-@app.route('/api/slots/status', methods=['GET'])
-def api_all_slots():
-    result = {}
-    for app_id in APP_IDS:
-        rows = get_app_slots(app_id)
-        slots = []
-        for r in rows:
-            if r[10]:
-                try:
-                    rem = int((datetime.strptime(r[9], '%Y-%m-%d %H:%M:%S') - datetime.now()).total_seconds())
-                except:
-                    rem = 0
-                slots.append({"slot": r[0], "status": "BUSY", "remaining": max(0, rem)})
-            else:
-                slots.append({"slot": r[0], "status": "FREE", "remaining": 0})
-        active = sum(1 for s in slots if s["status"] == "BUSY")
-        result[app_id] = {"slots": slots, "active": active, "max": SLOTS_PER_APP}
-    return jsonify(result)
+    key, expiry = generate_key(days, app_id, slots)
+
+    bot.reply_to(message, f"""✅ **Key Generated**
+
+🔑 Key: `{key}`
+📱 App: `{app_id}`
+📅 Expiry: {expiry}
+⏱ Days: {days}
+🎯 Slots: {slots}
+
+**User ko ye key de do is app ke liye.**""", parse_mode='Markdown')
 
 
-@app.route('/api/dd', methods=['POST'])
-def api_dd():
-    if not check_auth():
-        return jsonify({"status": "ERROR", "reason": "Unauthorized"}), 401
+@bot.message_handler(commands=['listkeys'])
+def cmd_listkeys(message):
+    if not is_owner(message.from_user.id):
+        return
 
-    client_ip = request.remote_addr
-    if not check_rate_limit(client_ip, max_requests=15, window=60):
-        return jsonify({"status": "ERROR", "reason": "RateLimit"})
+    command = message.text.split()
+    filter_app = command[1] if len(command) > 1 else None
 
-    data = request.json or {}
-    device_id = data.get('device_id', '').strip()
-    key = data.get('key', '').upper().strip()
-    ip = data.get('ip', '').strip()
-    port = str(data.get('port', '')).strip()
-    time_sec = int(data.get('time', 0))
-    pkg = data.get('package', APP_IDS[0])
+    conn = get_conn()
+    c = conn.cursor()
 
-    if not device_id:
-        return jsonify({"status": "ERROR", "reason": "NoDeviceID"})
-    if not key:
-        return jsonify({"status": "ERROR", "reason": "NoKey"})
-    if not ip or not port:
-        return jsonify({"status": "ERROR", "reason": "MissingIPPort"})
-    if time_sec < 10 or time_sec > 300:
-        return jsonify({"status": "ERROR", "reason": "InvalidTime"})
+    if filter_app:
+        c.execute('SELECT key, status, expiry, app_id FROM keys WHERE app_id = ? ORDER BY created_at DESC LIMIT 20', (filter_app,))
+    else:
+        c.execute('SELECT key, status, expiry, app_id FROM keys ORDER BY created_at DESC LIMIT 20')
 
-    if pkg not in APP_IDS:
-        return jsonify({"status": "ERROR", "reason": "UnknownApp", "valid": APP_IDS})
+    rows = c.fetchall()
+    conn.close()
 
-    expiry, status, _ = verify_key_with_device(key, device_id)
-    if status != "VALID":
-        return jsonify({"status": "ERROR", "reason": status})
+    if not rows:
+        bot.reply_to(message, "ℹ️ No keys")
+        return
 
-    authorized, user_key, reason = is_device_authorized(device_id)
-    if not authorized:
-        return jsonify({"status": "ERROR", "reason": reason})
+    response = "🔑 **KEYS**\n\n"
+    for k in rows:
+        response += f"`{k[0]}`\n  {k[1]} | {k[2]} | `{k[3]}`\n\n"
 
-    slot_id, slot_status = allot_slot(pkg, device_id, key, pkg, ip, port, time_sec)
-
-    if slot_status == "ALREADY_ACTIVE":
-        return jsonify({"status": "ERROR", "reason": "AlreadyActive",
-                        "message": "Aapka ek attack already chal raha hai"})
-
-    if slot_status == "KEY_SLOTS_FULL":
-        return jsonify({"status": "ERROR", "reason": "KeySlotsFull",
-                        "message": "Aapki key ke saare slots busy hain"})
-
-    if slot_id is None:
-        return jsonify({"status": "ERROR", "reason": "SlotsFull",
-                        "message": f"App {pkg} ke saare slots busy hain"})
-
-    notify_owner_dd(f"/bgmi {ip} {port} {time_sec} {pkg}")
-    print(f"📤 DM sent: /bgmi {ip} {port} {time_sec} {pkg}")
-
-    end = datetime.now() + timedelta(seconds=time_sec)
-    return jsonify({
-        "status": "SLOT_ALLOTTED",
-        "app_id": pkg,
-        "slot": slot_id,
-        "ip": ip,
-        "port": port,
-        "time": time_sec,
-        "end_time": end.strftime('%H:%M:%S')
-    })
+    bot.reply_to(message, response, parse_mode='Markdown')
 
 
-def auto_release_loop():
-    while True:
-        try:
-            for app_id, slot_id in get_expired_slots():
-                release_slot(app_id, slot_id)
-                print(f"✅ Released {app_id} slot #{slot_id}")
-        except Exception as e:
-            print(f"Auto-release: {e}")
-        time.sleep(5)
+@bot.message_handler(commands=['delkey'])
+def cmd_delkey(message):
+    if not is_owner(message.from_user.id):
+        return
+
+    command = message.text.split()
+    if len(command) != 2:
+        bot.reply_to(message, "❌ Usage: `/delkey <key>`", parse_mode='Markdown')
+        return
+
+    key = command[1].upper()
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('UPDATE keys SET status = ? WHERE key = ?', (STATUS_DELETED, key))
+    conn.commit()
+    conn.close()
+
+    bot.reply_to(message, f"✅ Key `{key}` deleted", parse_mode='Markdown')
+
+
+@bot.message_handler(commands=['diskey'])
+def cmd_diskey(message):
+    if not is_owner(message.from_user.id):
+        return
+
+    command = message.text.split()
+    if len(command) != 2:
+        bot.reply_to(message, "❌ Usage: `/diskey <key>`", parse_mode='Markdown')
+        return
+
+    key = command[1].upper()
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('UPDATE keys SET status = ? WHERE key = ?', (STATUS_DISABLED, key))
+    conn.commit()
+    conn.close()
+
+    bot.reply_to(message, f"⛔ Key `{key}` disabled", parse_mode='Markdown')
+
+
+@bot.message_handler(commands=['enkey'])
+def cmd_enkey(message):
+    if not is_owner(message.from_user.id):
+        return
+
+    command = message.text.split()
+    if len(command) != 2:
+        bot.reply_to(message, "❌ Usage: `/enkey <key>`", parse_mode='Markdown')
+        return
+
+    key = command[1].upper()
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('UPDATE keys SET status = ? WHERE key = ?', (STATUS_ACTIVE, key))
+    conn.commit()
+    conn.close()
+
+    bot.reply_to(message, f"✅ Key `{key}` enabled", parse_mode='Markdown')
+
+
+@bot.message_handler(commands=['keyinfo'])
+def cmd_keyinfo(message):
+    if not is_owner(message.from_user.id):
+        return
+
+    command = message.text.split()
+    if len(command) != 2:
+        bot.reply_to(message, "❌ Usage: `/keyinfo <key>`", parse_mode='Markdown')
+        return
+
+    key = command[1].upper()
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT * FROM keys WHERE key = ?', (key,))
+    row = c.fetchone()
+    conn.close()
+
+    if not row:
+        bot.reply_to(message, "❌ Not found")
+        return
+
+    bot.reply_to(message, f"""🔑 **KEY INFO**
+
+Key: `{row[0]}`
+Device: `{row[1] or 'Not bound'}`
+Expiry: {row[2]}
+Status: {row[3]}
+Slots: {row[4]}
+App: `{row[5]}`
+""", parse_mode='Markdown')
+
+
+@bot.message_handler(commands=['resetbind'])
+def cmd_resetbind(message):
+    if not is_owner(message.from_user.id):
+        return
+
+    command = message.text.split()
+    if len(command) != 2:
+        bot.reply_to(message, "❌ Usage: `/resetbind <key>`", parse_mode='Markdown')
+        return
+
+    key = command[1].upper()
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('UPDATE keys SET device_id = NULL WHERE key = ?', (key,))
+    conn.commit()
+    conn.close()
+
+    bot.reply_to(message, f"🔄 Device reset for `{key}`", parse_mode='Markdown')
+
+
+@bot.message_handler(commands=['cleankeys'])
+def cmd_cleankeys(message):
+    if not is_owner(message.from_user.id):
+        return
+
+    conn = get_conn()
+    c = conn.cursor()
+    now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    c.execute('SELECT COUNT(*) FROM keys WHERE expiry < ? AND status = ?', (now_str, STATUS_ACTIVE))
+    count = c.fetchone()[0]
+    c.execute('DELETE FROM keys WHERE expiry < ? AND status = ?', (now_str, STATUS_ACTIVE))
+    conn.commit()
+    conn.close()
+
+    bot.reply_to(message, f"🧹 Cleaned {count} expired keys")
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Key Bot running!")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health():
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+        server.serve_forever()
+    except:
+        pass
 
 
 def main():
     init_db()
+    threading.Thread(target=start_health, daemon=True).start()
 
     print("=" * 60)
-    print("🛡️ RAGEBITE VPS BACKEND - 1 APK")
+    print("🔑 RAGEBITE KEY BOT (@KEY_SWARGBOT)")
     print("=" * 60)
+    print(f"👑 Owner: {OWNER_ID}")
     print(f"📱 Apps: {len(APP_IDS)}")
-    for app_id in APP_IDS:
-        print(f"   • {app_id} — {SLOTS_PER_APP} slots")
-    print(f"📊 Total Slots: {len(APP_IDS) * SLOTS_PER_APP}")
-    print(f"🌐 API Port: {API_PORT}")
-    print(f"🔑 API Secret: {API_SECRET[:15]}...")
+    for a in APP_IDS:
+        print(f"   • {a}")
+    print(f"🔧 Maintenance: {get_maintenance().upper()}")
     print("=" * 60)
-    print("✅ Server running...")
+    print("✅ Key Bot running...")
     print("=" * 60)
 
-    threading.Thread(target=auto_release_loop, daemon=True).start()
+    while True:
+        try:
+            bot.polling(non_stop=True, interval=1, timeout=10, long_polling_timeout=10)
+        except Exception as e:
+            print(f"⚠️ Error: {e}")
+            time.sleep(5)
 
-    app.run(host='0.0.0.0', port=API_PORT, debug=False, use_reloader=False, threaded=True)
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
